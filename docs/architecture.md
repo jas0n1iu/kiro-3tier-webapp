@@ -6,29 +6,78 @@
 ## 2. 架构图
 ```mermaid
 flowchart TB
-  U([用户 Internet]) -->|HTTP 80 / 可选 HTTPS 443| ALB
-  subgraph VPC["VPC 10.0.0.0/16 (vpc-webapp-env-region-001)  + Flow Logs"]
-    subgraph PUB["公网子网 pub × 2 AZ"]
-      ALB["ALB<br/>alb-webapp-web-…"]
-      NAT["NAT Gateway ×1 (AZ-a)"]
+  U(["用户 Internet"])
+
+  subgraph REGION["AWS 区域（由部署区域决定，当前 ap-northeast-2）"]
+    subgraph VPC["VPC 10.0.0.0/16 ｜ 开启 VPC Flow Logs"]
+      IGW["Internet Gateway"]
+      ALB["ALB（跨 pub-a / pub-b）<br/>ALB SG：80，可选 443"]
+
+      subgraph AZA["可用区 a"]
+        subgraph PUBA["公网子网 pub-a"]
+          NAT["NAT Gateway<br/>单点：仅 a 区"]
+        end
+        subgraph APPA["应用子网 app-a ｜ App SG"]
+          EC2A["应用实例<br/>nginx + CloudWatch Agent"]
+        end
+        subgraph DATAA["数据子网 data-a ｜ DB SG"]
+          DB["数据库主机 EC2<br/>MariaDB 10.11<br/>单点：仅 a 区"]
+          VOL[("加密数据卷<br/>/var/lib/mysql")]
+        end
+      end
+
+      subgraph AZB["可用区 b"]
+        subgraph PUBB["公网子网 pub-b"]
+          PUBBNOTE["ALB 节点所在子网"]
+        end
+        subgraph APPB["应用子网 app-b ｜ App SG"]
+          EC2B["应用实例<br/>nginx + CloudWatch Agent"]
+        end
+        subgraph DATAB["数据子网 data-b ｜ DB SG"]
+          RDSALT["RDS MySQL<br/>仅 DbMode=rds，当前未启用"]
+        end
+      end
     end
-    subgraph APP["应用子网 app × 2 AZ (私有)"]
-      ASG["EC2 Auto Scaling 2–4 台<br/>AL2023 + nginx + CW Agent<br/>IMDSv2 / EBS 加密 / SSM"]
-    end
-    subgraph DATA["数据子网 data × 2 AZ (仅出网经 NAT，无入站路径)"]
-      RDS[("数据库主机 EC2 (默认 DbMode=ec2)<br/>MariaDB 10.11 / 加密数据盘<br/>可切换为 RDS MySQL (DbMode=rds)")]
-    end
-    RDS -.->|每日 mysqldump| S3[("S3 备份桶")]
-    ALB -->|80, 仅来自 ALB SG| ASG
-    ASG -->|3306, 仅来自 App SG| RDS
-    ASG -->|出网: 装包 / SSM / 日志| NAT
-    RDS -->|出网: 装包 / SSM / S3| NAT
+
+    CW["CloudWatch<br/>7 个告警 + 日志组<br/>（告警无通知）"]
+    S3[("S3 备份桶<br/>每日 mysqldump")]
+    SSM["SSM 参数库<br/>数据库 admin 密码"]
   end
-  NAT --> IGW[Internet Gateway]
-  ASG -. 指标 & 日志 .-> CW["CloudWatch<br/>7 个告警 + 日志组"]
-  RDS -. 指标 .-> CW
-  ALB -. 指标 .-> CW
+
+  U -->|"HTTP 80 / 可选 HTTPS 443"| IGW
+  IGW --> ALB
+  ALB -->|"80，仅来自 ALB SG"| EC2A
+  ALB -->|"80，仅来自 ALB SG"| EC2B
+  EC2A -->|"3306，仅来自 App SG"| DB
+  EC2B -->|"3306，仅来自 App SG"| DB
+  DB --- VOL
+
+  EC2A -.->|"出网：装包 / SSM / 日志"| NAT
+  EC2B -.->|"出网：装包 / SSM / 日志"| NAT
+  DB -.->|"出网：装包 / SSM / S3"| NAT
+  NAT -.-> IGW
+
+  EC2A -.->|"指标 / 日志"| CW
+  EC2B -.->|"指标 / 日志"| CW
+  DB -.->|"指标"| CW
+  ALB -.->|"指标"| CW
+  VPC -.->|"Flow Logs"| CW
+  DB -.->|"每日备份"| S3
+  DB -.->|"首次启动写入密码"| SSM
+
+  classDef spof fill:#ffe3e3,stroke:#d63031,stroke-width:2px,color:#000;
+  classDef off fill:#f1f2f6,stroke:#999,stroke-dasharray:5 5,color:#555;
+  class NAT,DB spof;
+  class RDSALT off;
 ```
+
+图例与读图说明
+- 实线：业务流量（含端口和来源限制）；虚线：出网、指标、日志、备份等辅助流。
+- 红色节点：单点。NAT 只在 a 区；数据库主机只在 a 区。a 区故障时，应用层出网中断、数据库不可用。
+- 灰色虚线节点：`DbMode=rds` 时才创建的 RDS，当前部署未启用（账号无 RDS 权限）。当前 data-b 子网为空，仅为将来 RDS 的子网组预留。
+- ALB 是一个跨 pub-a 与 pub-b 的逻辑资源，图中画在两区之间；两个应用实例分布在 a、b 两区。
+- 安全组边界以子网标题中的 SG 名标注：ALB SG → App SG → DB SG，逐层只允许上一层访问。
+- 告警目前没有通知动作（部署角色无 SNS 权限）。HTTPS 默认不启用，传入证书 ARN 后才会有 443。
 
 ## 3. 分层设计
 - 表现层：Internet-facing ALB 位于两个公网子网。HTTP 健康检查 `/health`。传入 ACM 证书 ARN 后自动增加 443 监听（TLS1.3/1.2 策略），80 跳转 443。ALB 丢弃非法头；prod 开删除保护。
