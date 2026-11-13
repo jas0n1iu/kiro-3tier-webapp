@@ -1,0 +1,948 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  Three-tier web app (ALB -> EC2 Auto Scaling -> RDS MySQL) with CloudWatch alarms (no notifications) and flow logs;
+  data tier is RDS (DbMode=rds) or, when RDS is not permitted, self-managed MariaDB on EC2 (DbMode=ec2)
+  - app/data tiers stay private; single NAT is a deliberate cost trade-off.
+  Resource names follow the CAF-style naming spec in .kiro/steering/.
+
+Metadata:
+  AWSToolsMetrics:
+    AWSAgentToolkit: aws-cloudformation@3
+
+# Region-agnostic: RegionCode is derived from AWS::Region by deploy.sh.
+# Required tags (org, workload, env, owner, managed-by) are applied as stack tags by deploy.sh
+# and propagate to every taggable resource. Name and data-class are set per resource below.
+# Design rationale: .kiro/specs/three-tier-webapp/design.md and docs/architecture.md.
+
+Parameters:
+  CertificateArn:
+    Type: String
+    Default: ''
+    AllowedPattern: '^$|^arn:aws[a-z-]*:acm:[a-z0-9-]+:[0-9]{12}:certificate/[a-f0-9-]+$'
+    Description: ACM certificate ARN in the same region. Empty = HTTP only; set = HTTPS on 443 and 80 redirects to 443.
+  LogRetentionDays:
+    Type: Number
+    Default: 14
+    AllowedValues: [7, 14, 30, 60, 90]
+  DbConnAlarmThreshold:
+    Type: Number
+    Default: 40
+    Description: DatabaseConnections alarm threshold. Tune to the instance class (db.t3.micro allows roughly 60-80).
+  Workload:
+    Type: String
+    Default: webapp
+    AllowedPattern: '^[a-z0-9]{2,12}$'
+    AllowedValues: [webapp]
+    Description: Must be registered in aws-naming-registry.md
+  Env:
+    Type: String
+    Default: dev
+    AllowedValues: [prod, stg, uat, test, dev, sbx]
+  RegionCode:
+    Type: String
+    AllowedPattern: '^[a-z]{3,5}[0-9]?$'
+    Description: Region code from the naming spec (e.g. usw2). Supplied by deploy.sh.
+  Instance:
+    Type: String
+    Default: '001'
+    AllowedPattern: '^[0-9]{3}$'
+  VpcCidr:
+    Type: String
+    Default: 10.0.0.0/16
+  AppInstanceType:
+    Type: String
+    Default: t3.micro
+  AppMinSize:
+    Type: Number
+    Default: 2
+  AppMaxSize:
+    Type: Number
+    Default: 4
+  Org:
+    Type: String
+    Default: kiro
+    AllowedPattern: '^[a-z0-9]{2,8}$'
+    Description: Organization short code, used in the globally unique backup bucket name.
+  DbMode:
+    Type: String
+    Default: ec2
+    AllowedValues: [ec2, rds]
+    Description: >-
+      ec2 = self-managed MariaDB on one EC2 instance (no RDS permission needed; you own patching, HA, backups).
+      rds = managed RDS MySQL. Switching an existing stack between modes replaces the database: migrate data first.
+  DbHostInstanceType:
+    Type: String
+    Default: t3.micro
+    Description: DbMode=ec2 only.
+  DbHostVolumeGiB:
+    Type: Number
+    Default: 20
+    MinValue: 8
+    MaxValue: 1000
+    Description: DbMode=ec2 only. Size of the encrypted gp3 data volume mounted at /var/lib/mysql.
+  DbBackupRetentionDays:
+    Type: Number
+    Default: 14
+    MinValue: 1
+    MaxValue: 365
+    Description: DbMode=ec2 only. Daily mysqldump objects expire after this many days.
+  DbInstanceClass:
+    Type: String
+    Default: db.t3.micro
+    Description: DbMode=rds only.
+  DbMultiAz:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+  AmiId:
+    Type: 'AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>'
+    Default: /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64
+
+Conditions:
+  IsProd: !Equals [!Ref Env, prod]
+  UseRds: !Equals [!Ref DbMode, rds]
+  UseEc2Db: !Equals [!Ref DbMode, ec2]
+  HasCert: !Not [!Equals [!Ref CertificateArn, '']]
+
+Resources:
+  # ---------------------------------------------------------------- Network
+  Vpc:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: !Ref VpcCidr
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - { Key: Name, Value: !Sub 'vpc-${Workload}-${Env}-${RegionCode}-${Instance}' }
+
+  Igw:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - { Key: Name, Value: !Sub 'igw-${Workload}-${Env}-${RegionCode}-${Instance}' }
+
+  IgwAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref Vpc
+      InternetGatewayId: !Ref Igw
+
+  # Subnets: /24 blocks carved from VpcCidr. Letters a/b follow the AZ order returned by GetAZs.
+  SubnetPubA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      AvailabilityZone: !Select [0, !GetAZs '']
+      CidrBlock: !Select [0, !Cidr [!Ref VpcCidr, 6, 8]]
+      Tags:
+        - { Key: Name, Value: !Sub 'snet-${Workload}-pub-${Env}-${RegionCode}-a001' }
+  SubnetPubB:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      AvailabilityZone: !Select [1, !GetAZs '']
+      CidrBlock: !Select [1, !Cidr [!Ref VpcCidr, 6, 8]]
+      Tags:
+        - { Key: Name, Value: !Sub 'snet-${Workload}-pub-${Env}-${RegionCode}-b001' }
+  SubnetAppA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      AvailabilityZone: !Select [0, !GetAZs '']
+      CidrBlock: !Select [2, !Cidr [!Ref VpcCidr, 6, 8]]
+      Tags:
+        - { Key: Name, Value: !Sub 'snet-${Workload}-app-${Env}-${RegionCode}-a001' }
+  SubnetAppB:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      AvailabilityZone: !Select [1, !GetAZs '']
+      CidrBlock: !Select [3, !Cidr [!Ref VpcCidr, 6, 8]]
+      Tags:
+        - { Key: Name, Value: !Sub 'snet-${Workload}-app-${Env}-${RegionCode}-b001' }
+  SubnetDataA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      AvailabilityZone: !Select [0, !GetAZs '']
+      CidrBlock: !Select [4, !Cidr [!Ref VpcCidr, 6, 8]]
+      Tags:
+        - { Key: Name, Value: !Sub 'snet-${Workload}-data-${Env}-${RegionCode}-a001' }
+  SubnetDataB:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      AvailabilityZone: !Select [1, !GetAZs '']
+      CidrBlock: !Select [5, !Cidr [!Ref VpcCidr, 6, 8]]
+      Tags:
+        - { Key: Name, Value: !Sub 'snet-${Workload}-data-${Env}-${RegionCode}-b001' }
+
+  NatEip:
+    Type: AWS::EC2::EIP
+    DependsOn: IgwAttachment
+    Properties:
+      Domain: vpc
+      Tags:
+        - { Key: Name, Value: !Sub 'pip-${Workload}-nat-${Env}-${RegionCode}-${Instance}' }
+
+  # One NAT Gateway (AZ a) keeps cost low; add a second one in AZ b for full AZ-level HA.
+  NatGateway:
+    Type: AWS::EC2::NatGateway
+    Properties:
+      AllocationId: !GetAtt NatEip.AllocationId
+      SubnetId: !Ref SubnetPubA
+      Tags:
+        - { Key: Name, Value: !Sub 'ng-${Workload}-${Env}-${RegionCode}-a001' }
+
+  RtPub:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref Vpc
+      Tags:
+        - { Key: Name, Value: !Sub 'rt-${Workload}-pub-${Env}-${RegionCode}-${Instance}' }
+  RoutePubDefault:
+    Type: AWS::EC2::Route
+    DependsOn: IgwAttachment
+    Properties:
+      RouteTableId: !Ref RtPub
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref Igw
+  RtPubAssocA:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties: { SubnetId: !Ref SubnetPubA, RouteTableId: !Ref RtPub }
+  RtPubAssocB:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties: { SubnetId: !Ref SubnetPubB, RouteTableId: !Ref RtPub }
+
+  RtApp:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref Vpc
+      Tags:
+        - { Key: Name, Value: !Sub 'rt-${Workload}-app-${Env}-${RegionCode}-${Instance}' }
+  RouteAppDefault:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref RtApp
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref NatGateway
+  RtAppAssocA:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties: { SubnetId: !Ref SubnetAppA, RouteTableId: !Ref RtApp }
+  RtAppAssocB:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties: { SubnetId: !Ref SubnetAppB, RouteTableId: !Ref RtApp }
+
+  # Data tier has no route out of the VPC when DbMode=rds; see RouteDataDefault for DbMode=ec2.
+  RtData:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref Vpc
+      Tags:
+        - { Key: Name, Value: !Sub 'rt-${Workload}-data-${Env}-${RegionCode}-${Instance}' }
+  # DbMode=ec2: the database host needs outbound access (dnf, SSM, S3 backups). Outbound only, no inbound path.
+  RouteDataDefault:
+    Type: AWS::EC2::Route
+    Condition: UseEc2Db
+    Properties:
+      RouteTableId: !Ref RtData
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref NatGateway
+  RtDataAssocA:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties: { SubnetId: !Ref SubnetDataA, RouteTableId: !Ref RtData }
+  RtDataAssocB:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties: { SubnetId: !Ref SubnetDataB, RouteTableId: !Ref RtData }
+
+  # --------------------------------------------------------- Security groups
+  SgAlb:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub 'nsg-${Workload}-alb-${Env}-${RegionCode}-${Instance}'
+      GroupDescription: Public ALB, HTTP from the internet
+      VpcId: !Ref Vpc
+      SecurityGroupIngress:
+        - { IpProtocol: tcp, FromPort: 80, ToPort: 80, CidrIp: 0.0.0.0/0, Description: HTTP from internet }
+      Tags:
+        - { Key: Name, Value: !Sub 'nsg-${Workload}-alb-${Env}-${RegionCode}-${Instance}' }
+
+  # HTTPS ingress exists only when a certificate is supplied.
+  SgAlbHttps:
+    Type: AWS::EC2::SecurityGroupIngress
+    Condition: HasCert
+    Properties:
+      GroupId: !Ref SgAlb
+      IpProtocol: tcp
+      FromPort: 443
+      ToPort: 443
+      CidrIp: 0.0.0.0/0
+      Description: HTTPS from internet
+
+  SgApp:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub 'nsg-${Workload}-app-${Env}-${RegionCode}-${Instance}'
+      GroupDescription: App tier, HTTP from the ALB only
+      VpcId: !Ref Vpc
+      SecurityGroupIngress:
+        - { IpProtocol: tcp, FromPort: 80, ToPort: 80, SourceSecurityGroupId: !Ref SgAlb, Description: HTTP from ALB }
+      Tags:
+        - { Key: Name, Value: !Sub 'nsg-${Workload}-app-${Env}-${RegionCode}-${Instance}' }
+
+  SgDb:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub 'nsg-${Workload}-db-${Env}-${RegionCode}-${Instance}'
+      GroupDescription: Data tier, MySQL from the app tier only
+      VpcId: !Ref Vpc
+      SecurityGroupIngress:
+        - { IpProtocol: tcp, FromPort: 3306, ToPort: 3306, SourceSecurityGroupId: !Ref SgApp, Description: MySQL from app tier }
+      Tags:
+        - { Key: Name, Value: !Sub 'nsg-${Workload}-db-${Env}-${RegionCode}-${Instance}' }
+
+  # ------------------------------------------------------------ Presentation
+  Alb:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: !Sub 'alb-${Workload}-web-${Env}-${RegionCode}-${Instance}'   # max 32 chars
+      Type: application
+      Scheme: internet-facing
+      Subnets: [!Ref SubnetPubA, !Ref SubnetPubB]
+      SecurityGroups: [!Ref SgAlb]
+      LoadBalancerAttributes:
+        - { Key: routing.http.drop_invalid_header_fields.enabled, Value: 'true' }
+        - { Key: deletion_protection.enabled, Value: !If [IsProd, 'true', 'false'] }
+      Tags:
+        - { Key: Name, Value: !Sub 'alb-${Workload}-web-${Env}-${RegionCode}-${Instance}' }
+
+  TargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: !Sub 'tg-${Workload}-web-${Env}-${RegionCode}-${Instance}'    # max 32 chars
+      VpcId: !Ref Vpc
+      Protocol: HTTP
+      Port: 80
+      TargetType: instance
+      HealthCheckPath: /health
+      HealthCheckIntervalSeconds: 15
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 3
+      Tags:
+        - { Key: Name, Value: !Sub 'tg-${Workload}-web-${Env}-${RegionCode}-${Instance}' }
+
+  # Port 80 forwards when there is no certificate, otherwise it redirects to HTTPS.
+  Listener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref Alb
+      Port: 80
+      Protocol: HTTP
+      DefaultActions:
+        - !If
+          - HasCert
+          - Type: redirect
+            RedirectConfig: { Protocol: HTTPS, Port: '443', StatusCode: HTTP_301 }
+          - Type: forward
+            TargetGroupArn: !Ref TargetGroup
+
+  ListenerHttps:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Condition: HasCert
+    Properties:
+      LoadBalancerArn: !Ref Alb
+      Port: 443
+      Protocol: HTTPS
+      SslPolicy: ELBSecurityPolicy-TLS13-1-2-2021-06
+      Certificates:
+        - CertificateArn: !Ref CertificateArn
+      DefaultActions:
+        - { Type: forward, TargetGroupArn: !Ref TargetGroup }
+
+  # ------------------------------------------------------------- Application
+  # Least privilege: SSM Session Manager (no SSH) + write to its own nginx log group only.
+  # No Secrets Manager access: the placeholder page never reads the DB secret.
+  AppRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub 'role-${Workload}-ec2app-${Env}-${RegionCode}-${Instance}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: ec2.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Sub 'arn:${AWS::Partition}:iam::aws:policy/AmazonSSMManagedInstanceCore'
+      Policies:
+        - PolicyName: !Sub 'pol-${Workload}-applogs-${Env}-${RegionCode}-${Instance}'
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: [logs:CreateLogStream, logs:PutLogEvents, logs:DescribeLogStreams]
+                Resource: !GetAtt AppLogGroup.Arn
+      Tags:
+        - { Key: Name, Value: !Sub 'role-${Workload}-ec2app-${Env}-${RegionCode}-${Instance}' }
+
+  AppLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/${Env}/${Workload}/${RegionCode}/ec2/nginx'
+      RetentionInDays: !Ref LogRetentionDays
+      Tags:
+        - { Key: Name, Value: !Sub '/${Env}/${Workload}/${RegionCode}/ec2/nginx' }
+
+  # Instance profile shares the Role name.
+  AppInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      InstanceProfileName: !Sub 'role-${Workload}-ec2app-${Env}-${RegionCode}-${Instance}'
+      Roles: [!Ref AppRole]
+
+  AppLaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateName: !Sub 'lt-${Workload}-web-${Env}-${RegionCode}-${Instance}'
+      LaunchTemplateData:
+        ImageId: !Ref AmiId
+        InstanceType: !Ref AppInstanceType
+        IamInstanceProfile: { Arn: !GetAtt AppInstanceProfile.Arn }
+        SecurityGroupIds: [!Ref SgApp]
+        MetadataOptions: { HttpTokens: required, HttpEndpoint: enabled }
+        TagSpecifications:
+          - ResourceType: instance
+            Tags:
+              - { Key: Name, Value: !Sub 'vm-${Workload}-web-${Env}-${RegionCode}-${Instance}' }
+          - ResourceType: volume
+            Tags:
+              - { Key: Name, Value: !Sub 'disk-${Workload}-web-${Env}-${RegionCode}-${Instance}' }
+              - { Key: data-class, Value: internal }
+        BlockDeviceMappings:
+          - DeviceName: /dev/xvda
+            Ebs: { VolumeType: gp3, VolumeSize: 8, Encrypted: true }
+        UserData:
+          Fn::Base64: !Sub
+            - |
+              #!/bin/bash
+              set -euxo pipefail
+              dnf install -y nginx amazon-cloudwatch-agent
+              TOKEN=$(curl -sX PUT http://169.254.169.254/latest/api/token -H 'X-aws-ec2-metadata-token-ttl-seconds: 300')
+              IID=$(curl -s -H "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/meta-data/instance-id)
+              cat > /opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json <<CWEOF
+              {"logs":{"logs_collected":{"files":{"collect_list":[
+                {"file_path":"/var/log/nginx/access.log","log_group_name":"${AppLogGroup}","log_stream_name":"{instance_id}/access"},
+                {"file_path":"/var/log/nginx/error.log","log_group_name":"${AppLogGroup}","log_stream_name":"{instance_id}/error"}
+              ]}}}}
+              CWEOF
+              /opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl -a fetch-config -m ec2 -s -c file:/opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json
+              echo ok > /usr/share/nginx/html/health
+              cat > /usr/share/nginx/html/index.html <<EOF
+              <!doctype html><html lang="en"><head><meta charset="utf-8"><title>${Workload} ${Env}</title></head>
+              <body><h1>${Workload} (${Env})</h1><p>Served by instance $IID in ${AWS::Region}.</p>
+              <p>Database endpoint: ${DbHost}</p></body></html>
+              EOF
+              systemctl enable --now nginx
+            - DbHost: !If [UseRds, !GetAtt Database.Endpoint.Address, !GetAtt DbInstance.PrivateIp]
+
+  AppAsg:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    DependsOn: [RouteAppDefault]
+    Properties:
+      AutoScalingGroupName: !Sub 'asg-${Workload}-web-${Env}-${RegionCode}-${Instance}'
+      MinSize: !Ref AppMinSize
+      MaxSize: !Ref AppMaxSize
+      DesiredCapacity: !Ref AppMinSize
+      VPCZoneIdentifier: [!Ref SubnetAppA, !Ref SubnetAppB]
+      TargetGroupARNs: [!Ref TargetGroup]
+      HealthCheckType: ELB
+      HealthCheckGracePeriod: 180
+      MetricsCollection:
+        - Granularity: 1Minute
+      LaunchTemplate:
+        LaunchTemplateId: !Ref AppLaunchTemplate
+        Version: !GetAtt AppLaunchTemplate.LatestVersionNumber
+      Tags:
+        - { Key: Name, Value: !Sub 'asg-${Workload}-web-${Env}-${RegionCode}-${Instance}', PropagateAtLaunch: false }
+    UpdatePolicy:
+      AutoScalingRollingUpdate:
+        MinInstancesInService: 1
+        MaxBatchSize: 1
+        PauseTime: PT2M
+
+  AppScalingPolicy:
+    Type: AWS::AutoScaling::ScalingPolicy
+    Properties:
+      AutoScalingGroupName: !Ref AppAsg
+      PolicyType: TargetTrackingScaling
+      TargetTrackingConfiguration:
+        PredefinedMetricSpecification: { PredefinedMetricType: ASGAverageCPUUtilization }
+        TargetValue: 50
+
+  # -------------------------------------------------------------------- Data
+  DbSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Condition: UseRds
+    Properties:
+      DBSubnetGroupName: !Sub 'dbsng-${Workload}-${Env}-${RegionCode}-${Instance}'
+      DBSubnetGroupDescription: Data-tier subnets
+      SubnetIds: [!Ref SubnetDataA, !Ref SubnetDataB]
+      Tags:
+        - { Key: Name, Value: !Sub 'dbsng-${Workload}-${Env}-${RegionCode}-${Instance}' }
+
+  Database:
+    Type: AWS::RDS::DBInstance
+    Condition: UseRds
+    DeletionPolicy: Snapshot
+    UpdateReplacePolicy: Snapshot
+    Properties:
+      DBInstanceIdentifier: !Sub 'rds-${Workload}-${Env}-${RegionCode}-${Instance}'
+      Engine: mysql
+      DBInstanceClass: !Ref DbInstanceClass
+      AllocatedStorage: 20
+      StorageType: gp3
+      StorageEncrypted: true
+      MasterUsername: admin
+      ManageMasterUserPassword: true      # secret is service-managed (rds!db-*), tag only
+      MultiAZ: !Ref DbMultiAz
+      PubliclyAccessible: false
+      BackupRetentionPeriod: 7
+      CopyTagsToSnapshot: true
+      DeletionProtection: !If [IsProd, true, false]
+      DBSubnetGroupName: !Ref DbSubnetGroup
+      VPCSecurityGroups: [!Ref SgDb]
+      Tags:
+        - { Key: Name, Value: !Sub 'rds-${Workload}-${Env}-${RegionCode}-${Instance}' }
+        - { Key: data-class, Value: confidential }
+
+  # ------------------------------------------------- Data tier, DbMode=ec2 (self-managed MariaDB)
+  # For accounts where RDS is not permitted. NOT managed: patching, HA and backup are ours (docs/architecture.md).
+  # One instance in AZ a. Data lives on a separate encrypted volume that survives instance replacement.
+  DbHostRole:
+    Type: AWS::IAM::Role
+    Condition: UseEc2Db
+    Properties:
+      RoleName: !Sub 'role-${Workload}-dbhost-${Env}-${RegionCode}-${Instance}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: ec2.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Sub 'arn:${AWS::Partition}:iam::aws:policy/AmazonSSMManagedInstanceCore'
+      Policies:
+        - PolicyName: !Sub 'pol-${Workload}-dbhost-${Env}-${RegionCode}-${Instance}'
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: StoreGeneratedAdminPassword
+                Effect: Allow
+                Action: ssm:PutParameter
+                Resource: !Sub 'arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${Env}/${Workload}/${RegionCode}/db/admin'
+              - Sid: WriteBackups
+                Effect: Allow
+                Action: s3:PutObject
+                Resource: !Sub '${DbBackupBucket.Arn}/*'
+      Tags:
+        - { Key: Name, Value: !Sub 'role-${Workload}-dbhost-${Env}-${RegionCode}-${Instance}' }
+
+  DbHostInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Condition: UseEc2Db
+    Properties:
+      InstanceProfileName: !Sub 'role-${Workload}-dbhost-${Env}-${RegionCode}-${Instance}'
+      Roles: [!Ref DbHostRole]
+
+  # Backups are kept on Retain: the bucket outlives the stack by design (empty and delete it during cleanup).
+  DbBackupBucket:
+    Type: AWS::S3::Bucket
+    Condition: UseEc2Db
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BucketName: !Sub 's3-${Org}-${Workload}-dbbackup-${Env}-${RegionCode}-${Instance}'
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault: { SSEAlgorithm: AES256 }
+      VersioningConfiguration: { Status: Enabled }
+      LifecycleConfiguration:
+        Rules:
+          - Id: expire-dumps
+            Status: Enabled
+            ExpirationInDays: !Ref DbBackupRetentionDays
+            NoncurrentVersionExpiration: { NoncurrentDays: 1 }
+            AbortIncompleteMultipartUpload: { DaysAfterInitiation: 1 }
+      Tags:
+        - { Key: Name, Value: !Sub 's3-${Org}-${Workload}-dbbackup-${Env}-${RegionCode}-${Instance}' }
+        - { Key: data-class, Value: confidential }
+
+  DbBackupBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Condition: UseEc2Db
+    Properties:
+      Bucket: !Ref DbBackupBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: '*'
+            Action: 's3:*'
+            Resource: [!GetAtt DbBackupBucket.Arn, !Sub '${DbBackupBucket.Arn}/*']
+            Condition:
+              Bool: { 'aws:SecureTransport': 'false' }
+
+  DbDataVolume:
+    Type: AWS::EC2::Volume
+    Condition: UseEc2Db
+    DeletionPolicy: Snapshot
+    UpdateReplacePolicy: Snapshot
+    Properties:
+      AvailabilityZone: !GetAtt SubnetDataA.AvailabilityZone
+      Size: !Ref DbHostVolumeGiB
+      VolumeType: gp3
+      Encrypted: true
+      Tags:
+        - { Key: Name, Value: !Sub 'disk-${Workload}-dbdata-${Env}-${RegionCode}-${Instance}' }
+        - { Key: data-class, Value: confidential }
+
+  # AWS::EC2::Instance cannot tag or encrypt the root volume itself, so a launch template carries that.
+  DbLaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Condition: UseEc2Db
+    Properties:
+      LaunchTemplateName: !Sub 'lt-${Workload}-db-${Env}-${RegionCode}-${Instance}'
+      LaunchTemplateData:
+        BlockDeviceMappings:
+          - DeviceName: /dev/xvda
+            Ebs: { VolumeType: gp3, VolumeSize: 8, Encrypted: true }
+        TagSpecifications:
+          - ResourceType: volume
+            Tags:
+              - { Key: Name, Value: !Sub 'disk-${Workload}-dbroot-${Env}-${RegionCode}-${Instance}' }
+              - { Key: data-class, Value: internal }
+
+  DbInstance:
+    Type: AWS::EC2::Instance
+    Condition: UseEc2Db
+    DependsOn: [RouteDataDefault, RtDataAssocA]
+    Properties:
+      ImageId: !Ref AmiId
+      InstanceType: !Ref DbHostInstanceType
+      SubnetId: !Ref SubnetDataA
+      SecurityGroupIds: [!Ref SgDb]
+      IamInstanceProfile: !Ref DbHostInstanceProfile
+      DisableApiTermination: !If [IsProd, true, false]
+      MetadataOptions: { HttpTokens: required, HttpEndpoint: enabled }
+      LaunchTemplate:
+        LaunchTemplateId: !Ref DbLaunchTemplate
+        Version: !GetAtt DbLaunchTemplate.LatestVersionNumber
+      Tags:
+        - { Key: Name, Value: !Sub 'vm-${Workload}-db-${Env}-${RegionCode}-${Instance}' }
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          set -euxo pipefail
+          dnf install -y mariadb1011-server
+
+          # Data volume (attached as /dev/sdf, appears as nvme1n1 on Nitro instances).
+          DEV=/dev/nvme1n1
+          for i in $(seq 1 60); do [ -b $DEV ] && break; sleep 5; done
+          [ -b $DEV ]
+          blkid $DEV || mkfs.xfs $DEV
+          mkdir -p /var/lib/mysql
+          echo "UUID=$(blkid -s UUID -o value $DEV) /var/lib/mysql xfs defaults,nofail 0 2" >> /etc/fstab
+          mount /var/lib/mysql
+          chown mysql:mysql /var/lib/mysql
+
+          cat > /etc/my.cnf.d/99-webapp.cnf <<'CNF'
+          [mysqld]
+          bind-address=0.0.0.0
+          CNF
+          systemctl enable --now mariadb
+
+          # Random admin password -> SSM SecureString. Tracing is off so it never reaches the cloud-init log.
+          set +x
+          umask 077
+          PW=$(openssl rand -base64 24 | tr -d '/+=' | cut -c1-24)
+          mysql -uroot <<SQL
+          CREATE USER IF NOT EXISTS 'admin'@'%' IDENTIFIED BY '$PW';
+          GRANT ALL PRIVILEGES ON *.* TO 'admin'@'%' WITH GRANT OPTION;
+          FLUSH PRIVILEGES;
+          SQL
+          printf %s "$PW" > /root/.dbpw
+          unset PW
+          aws ssm put-parameter --region ${AWS::Region} --name /${Env}/${Workload}/${RegionCode}/db/admin \
+            --type SecureString --overwrite --value file:///root/.dbpw > /dev/null
+          rm -f /root/.dbpw
+          set -x
+
+          # Daily logical backup to S3 (systemd timer; AL2023 ships no cron).
+          cat > /usr/local/bin/db-backup.sh <<'BK'
+          #!/bin/bash
+          set -euo pipefail
+          mysqldump --all-databases --single-transaction --routines --events | gzip \
+            | aws s3 cp - "s3://${DbBackupBucket}/dump-$(date -u +%Y%m%dT%H%M%SZ).sql.gz" --region ${AWS::Region}
+          BK
+          chmod 700 /usr/local/bin/db-backup.sh
+          cat > /etc/systemd/system/db-backup.service <<'UNIT'
+          [Unit]
+          Description=MariaDB logical backup to S3
+          [Service]
+          Type=oneshot
+          ExecStart=/usr/local/bin/db-backup.sh
+          UNIT
+          cat > /etc/systemd/system/db-backup.timer <<'UNIT'
+          [Unit]
+          Description=Daily MariaDB backup
+          [Timer]
+          OnCalendar=*-*-* 03:00:00
+          Persistent=true
+          [Install]
+          WantedBy=timers.target
+          UNIT
+          systemctl daemon-reload
+          systemctl enable --now db-backup.timer
+          systemctl start db-backup.service || true   # first backup now, proves the S3 path works
+
+  DbDataAttachment:
+    Type: AWS::EC2::VolumeAttachment
+    Condition: UseEc2Db
+    Properties:
+      InstanceId: !Ref DbInstance
+      VolumeId: !Ref DbDataVolume
+      Device: /dev/sdf
+
+  # -------------------------------------------------------------- Observability
+  # VPC Flow Logs. No Name tag: the naming spec has no Flow Log prefix (see design.md, known gaps).
+  FlowLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/${Env}/${Workload}/${RegionCode}/vpc/flowlogs'
+      RetentionInDays: !Ref LogRetentionDays
+      Tags:
+        - { Key: Name, Value: !Sub '/${Env}/${Workload}/${RegionCode}/vpc/flowlogs' }
+
+  FlowLogRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub 'role-${Workload}-flowlog-${Env}-${RegionCode}-${Instance}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: vpc-flow-logs.amazonaws.com }
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals: { 'aws:SourceAccount': !Ref 'AWS::AccountId' }
+              ArnLike: { 'aws:SourceArn': !Sub 'arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:vpc-flow-log/*' }
+      Policies:
+        - PolicyName: !Sub 'pol-${Workload}-flowlog-${Env}-${RegionCode}-${Instance}'
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: [logs:CreateLogStream, logs:PutLogEvents, logs:DescribeLogStreams]
+                Resource: !GetAtt FlowLogGroup.Arn
+      Tags:
+        - { Key: Name, Value: !Sub 'role-${Workload}-flowlog-${Env}-${RegionCode}-${Instance}' }
+
+  FlowLog:
+    Type: AWS::EC2::FlowLog
+    Properties:
+      ResourceType: VPC
+      ResourceId: !Ref Vpc
+      TrafficType: ALL
+      LogDestinationType: cloud-watch-logs
+      LogGroupName: !Ref FlowLogGroup
+      DeliverLogsPermissionArn: !GetAtt FlowLogRole.Arn
+      MaxAggregationInterval: 600
+
+  # Alarms have no notification actions: SNS is not permitted for the deploying role. Add AlarmActions later.
+  AlarmAlb5xx:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub 'alrt-${Workload}-alb5xx-${Env}-${RegionCode}-${Instance}'
+      AlarmDescription: ALB itself returned 5xx (502/503/504) responses
+      Namespace: AWS/ApplicationELB
+      MetricName: HTTPCode_ELB_5XX_Count
+      Dimensions: [{ Name: LoadBalancer, Value: !GetAtt Alb.LoadBalancerFullName }]
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 10
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      Tags:
+        - { Key: Name, Value: !Sub 'alrt-${Workload}-alb5xx-${Env}-${RegionCode}-${Instance}' }
+
+  AlarmTarget5xx:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub 'alrt-${Workload}-tg5xx-${Env}-${RegionCode}-${Instance}'
+      AlarmDescription: App tier returned 5xx responses
+      Namespace: AWS/ApplicationELB
+      MetricName: HTTPCode_Target_5XX_Count
+      Dimensions:
+        - { Name: LoadBalancer, Value: !GetAtt Alb.LoadBalancerFullName }
+        - { Name: TargetGroup, Value: !GetAtt TargetGroup.TargetGroupFullName }
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 10
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      Tags:
+        - { Key: Name, Value: !Sub 'alrt-${Workload}-tg5xx-${Env}-${RegionCode}-${Instance}' }
+
+  AlarmUnhealthyHosts:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub 'alrt-${Workload}-tgunhealthy-${Env}-${RegionCode}-${Instance}'
+      AlarmDescription: At least one app instance failed the ALB health check for 3 minutes
+      Namespace: AWS/ApplicationELB
+      MetricName: UnHealthyHostCount
+      Dimensions:
+        - { Name: LoadBalancer, Value: !GetAtt Alb.LoadBalancerFullName }
+        - { Name: TargetGroup, Value: !GetAtt TargetGroup.TargetGroupFullName }
+      Statistic: Maximum
+      Period: 60
+      EvaluationPeriods: 3
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      Tags:
+        - { Key: Name, Value: !Sub 'alrt-${Workload}-tgunhealthy-${Env}-${RegionCode}-${Instance}' }
+
+  AlarmAsgCpu:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub 'alrt-${Workload}-asgcpu-${Env}-${RegionCode}-${Instance}'
+      AlarmDescription: App tier average CPU above 80% for 15 minutes (scaling is not keeping up)
+      Namespace: AWS/EC2
+      MetricName: CPUUtilization
+      Dimensions: [{ Name: AutoScalingGroupName, Value: !Ref AppAsg }]
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 3
+      Threshold: 80
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      Tags:
+        - { Key: Name, Value: !Sub 'alrt-${Workload}-asgcpu-${Env}-${RegionCode}-${Instance}' }
+
+  AlarmDbCpu:
+    Type: AWS::CloudWatch::Alarm
+    Condition: UseRds
+    Properties:
+      AlarmName: !Sub 'alrt-${Workload}-rdscpu-${Env}-${RegionCode}-${Instance}'
+      AlarmDescription: Database CPU above 80% for 15 minutes
+      Namespace: AWS/RDS
+      MetricName: CPUUtilization
+      Dimensions: [{ Name: DBInstanceIdentifier, Value: !Ref Database }]
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 3
+      Threshold: 80
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      Tags:
+        - { Key: Name, Value: !Sub 'alrt-${Workload}-rdscpu-${Env}-${RegionCode}-${Instance}' }
+
+  AlarmDbStorage:
+    Type: AWS::CloudWatch::Alarm
+    Condition: UseRds
+    Properties:
+      AlarmName: !Sub 'alrt-${Workload}-rdsstorage-${Env}-${RegionCode}-${Instance}'
+      AlarmDescription: Database free storage below 2 GiB (20 GiB allocated, no autoscaling configured)
+      Namespace: AWS/RDS
+      MetricName: FreeStorageSpace
+      Dimensions: [{ Name: DBInstanceIdentifier, Value: !Ref Database }]
+      Statistic: Minimum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 2147483648
+      ComparisonOperator: LessThanThreshold
+      TreatMissingData: breaching
+      Tags:
+        - { Key: Name, Value: !Sub 'alrt-${Workload}-rdsstorage-${Env}-${RegionCode}-${Instance}' }
+
+  AlarmDbConnections:
+    Type: AWS::CloudWatch::Alarm
+    Condition: UseRds
+    Properties:
+      AlarmName: !Sub 'alrt-${Workload}-rdsconn-${Env}-${RegionCode}-${Instance}'
+      AlarmDescription: Database connections above the configured threshold for 10 minutes
+      Namespace: AWS/RDS
+      MetricName: DatabaseConnections
+      Dimensions: [{ Name: DBInstanceIdentifier, Value: !Ref Database }]
+      Statistic: Maximum
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: !Ref DbConnAlarmThreshold
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      Tags:
+        - { Key: Name, Value: !Sub 'alrt-${Workload}-rdsconn-${Env}-${RegionCode}-${Instance}' }
+
+  AlarmDbHostCpu:
+    Type: AWS::CloudWatch::Alarm
+    Condition: UseEc2Db
+    Properties:
+      AlarmName: !Sub 'alrt-${Workload}-dbhostcpu-${Env}-${RegionCode}-${Instance}'
+      AlarmDescription: Database host CPU above 80% for 15 minutes
+      Namespace: AWS/EC2
+      MetricName: CPUUtilization
+      Dimensions: [{ Name: InstanceId, Value: !Ref DbInstance }]
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 3
+      Threshold: 80
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      Tags:
+        - { Key: Name, Value: !Sub 'alrt-${Workload}-dbhostcpu-${Env}-${RegionCode}-${Instance}' }
+
+  AlarmDbHostStatus:
+    Type: AWS::CloudWatch::Alarm
+    Condition: UseEc2Db
+    Properties:
+      AlarmName: !Sub 'alrt-${Workload}-dbhoststatus-${Env}-${RegionCode}-${Instance}'
+      AlarmDescription: Database host failed an EC2 status check (instance or system) for 2 minutes
+      Namespace: AWS/EC2
+      MetricName: StatusCheckFailed
+      Dimensions: [{ Name: InstanceId, Value: !Ref DbInstance }]
+      Statistic: Maximum
+      Period: 60
+      EvaluationPeriods: 2
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      Tags:
+        - { Key: Name, Value: !Sub 'alrt-${Workload}-dbhoststatus-${Env}-${RegionCode}-${Instance}' }
+
+Outputs:
+  SiteUrl:
+    Description: Public entry point (HTTP)
+    Value: !Sub 'http://${Alb.DNSName}'
+  DbEndpoint:
+    Description: Database host (RDS endpoint, or the private IP of the EC2 database host)
+    Value: !If [UseRds, !GetAtt Database.Endpoint.Address, !GetAtt DbInstance.PrivateIp]
+  DbSecretArn:
+    Condition: UseRds
+    Description: RDS-managed master secret
+    Value: !GetAtt Database.MasterUserSecret.SecretArn
+  DbAdminPasswordParameter:
+    Condition: UseEc2Db
+    Description: SSM SecureString holding the generated admin password (user 'admin')
+    Value: !Sub '/${Env}/${Workload}/${RegionCode}/db/admin'
+  DbBackupBucketName:
+    Condition: UseEc2Db
+    Description: Daily mysqldump backups (bucket is retained when the stack is deleted)
+    Value: !Ref DbBackupBucket

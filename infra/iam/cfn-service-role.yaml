@@ -1,0 +1,167 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  CloudFormation service role for the webapp three-tier stack - deployed ONCE by an account admin so the
+  day-to-day deployer role needs only iam:PassRole on it, not RDS/Secrets Manager rights itself.
+
+Metadata:
+  AWSToolsMetrics:
+    AWSAgentToolkit: aws-cloudformation@3
+
+# Deploy with ADMIN credentials, in the same region as the app stack:
+#   aws cloudformation deploy --stack-name stk-webapp-iam-dev-apne2-001 --template-file cfn-service-role.yaml \
+#     --capabilities CAPABILITY_NAMED_IAM --parameter-overrides Env=dev RegionCode=apne2 \
+#     --tags org=kiro workload=webapp env=dev owner=webapp-team@example.com managed-by=cfn
+# Scope: names are pinned to role/rds/log-group patterns of this workload+env+region. EC2/ELB/ASG are limited
+# to this region only (their create calls cannot be name-scoped). Trust is limited to CloudFormation stacks
+# named stk-<workload>-<env>-<region>-* in this account (confused-deputy conditions).
+
+Parameters:
+  Workload:
+    Type: String
+    Default: webapp
+    AllowedValues: [webapp]
+  Env:
+    Type: String
+    Default: dev
+    AllowedValues: [prod, stg, uat, test, dev, sbx]
+  RegionCode:
+    Type: String
+    AllowedPattern: '^[a-z]{3,5}[0-9]?$'
+  Instance:
+    Type: String
+    Default: '001'
+    AllowedPattern: '^[0-9]{3}$'
+
+Resources:
+  CfnServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub 'role-${Workload}-cfn-${Env}-${RegionCode}-${Instance}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: cloudformation.amazonaws.com }
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals: { 'aws:SourceAccount': !Ref 'AWS::AccountId' }
+              ArnLike:
+                'aws:SourceArn': !Sub 'arn:${AWS::Partition}:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/stk-${Workload}-${Env}-${RegionCode}-*/*'
+      Tags:
+        - { Key: Name, Value: !Sub 'role-${Workload}-cfn-${Env}-${RegionCode}-${Instance}' }
+
+  CfnServicePolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      ManagedPolicyName: !Sub 'pol-${Workload}-cfndeploy-${Env}-${RegionCode}-${Instance}'
+      Roles: [!Ref CfnServiceRole]
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: NetworkComputeThisRegionOnly
+            Effect: Allow
+            Action: ['ec2:*', 'elasticloadbalancing:*', 'autoscaling:*']
+            Resource: '*'
+            Condition:
+              StringEquals: { 'aws:RequestedRegion': !Ref 'AWS::Region' }
+          - Sid: RdsWorkloadOnly
+            Effect: Allow
+            Action:
+              - rds:CreateDBInstance
+              - rds:ModifyDBInstance
+              - rds:DeleteDBInstance
+              - rds:CreateDBSubnetGroup
+              - rds:ModifyDBSubnetGroup
+              - rds:DeleteDBSubnetGroup
+              - rds:AddTagsToResource
+              - rds:RemoveTagsFromResource
+              - rds:CreateDBSnapshot
+            Resource:
+              - !Sub 'arn:${AWS::Partition}:rds:${AWS::Region}:${AWS::AccountId}:db:rds-${Workload}-${Env}-${RegionCode}-*'
+              - !Sub 'arn:${AWS::Partition}:rds:${AWS::Region}:${AWS::AccountId}:subgrp:dbsng-${Workload}-${Env}-${RegionCode}-*'
+              - !Sub 'arn:${AWS::Partition}:rds:${AWS::Region}:${AWS::AccountId}:snapshot:stk-${Workload}-${Env}-${RegionCode}-*'
+              - !Sub 'arn:${AWS::Partition}:rds:${AWS::Region}:${AWS::AccountId}:pg:default.*'
+              - !Sub 'arn:${AWS::Partition}:rds:${AWS::Region}:${AWS::AccountId}:og:default:*'
+          - Sid: RdsReadAndKmsViaServices
+            Effect: Allow
+            Action: [rds:Describe*, rds:ListTagsForResource, ec2:Describe*]
+            Resource: '*'
+          - Sid: SecretsForRdsManagedPassword
+            Effect: Allow
+            Action: [secretsmanager:CreateSecret, secretsmanager:DeleteSecret, secretsmanager:DescribeSecret, secretsmanager:TagResource, secretsmanager:PutSecretValue]
+            Resource: !Sub 'arn:${AWS::Partition}:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:rds!db-*'
+          - Sid: KmsOnlyThroughRdsAndSecrets
+            Effect: Allow
+            Action: [kms:CreateGrant, kms:DescribeKey, kms:Decrypt, 'kms:GenerateDataKey*']
+            Resource: '*'
+            Condition:
+              StringLike:
+                'kms:ViaService': [!Sub 'rds.${AWS::Region}.amazonaws.com', !Sub 'secretsmanager.${AWS::Region}.amazonaws.com']
+          - Sid: LogsAndFlowLogDelivery
+            Effect: Allow
+            Action: [logs:CreateLogGroup, logs:DeleteLogGroup, logs:PutRetentionPolicy, logs:TagResource, logs:UntagResource, logs:ListTagsForResource, logs:ListTagsLogGroup, logs:TagLogGroup]
+            Resource: !Sub 'arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/${Env}/${Workload}/${RegionCode}/*'
+          - Sid: LogsReadAndDeliveryApis
+            Effect: Allow
+            Action: [logs:DescribeLogGroups, logs:CreateLogDelivery, logs:DeleteLogDelivery, logs:GetLogDelivery, logs:ListLogDeliveries, logs:UpdateLogDelivery, logs:PutResourcePolicy, logs:DescribeResourcePolicies]
+            Resource: '*'
+          - Sid: AlarmsWorkloadOnly
+            Effect: Allow
+            Action: [cloudwatch:PutMetricAlarm, cloudwatch:DeleteAlarms, cloudwatch:TagResource, cloudwatch:UntagResource, cloudwatch:ListTagsForResource]
+            Resource: !Sub 'arn:${AWS::Partition}:cloudwatch:${AWS::Region}:${AWS::AccountId}:alarm:alrt-${Workload}-*-${Env}-${RegionCode}-*'
+          - Sid: AlarmsRead
+            Effect: Allow
+            Action: [cloudwatch:DescribeAlarms]
+            Resource: '*'
+          - Sid: AmiParameter
+            Effect: Allow
+            Action: [ssm:GetParameters, ssm:GetParameter]
+            Resource: !Sub 'arn:${AWS::Partition}:ssm:${AWS::Region}::parameter/aws/service/ami-amazon-linux-latest/*'
+          - Sid: WorkloadRolesAndProfilesOnly
+            Effect: Allow
+            Action:
+              - iam:CreateRole
+              - iam:DeleteRole
+              - iam:GetRole
+              - iam:TagRole
+              - iam:UntagRole
+              - iam:PutRolePolicy
+              - iam:GetRolePolicy
+              - iam:DeleteRolePolicy
+              - iam:ListRolePolicies
+              - iam:ListAttachedRolePolicies
+              - iam:CreateInstanceProfile
+              - iam:DeleteInstanceProfile
+              - iam:GetInstanceProfile
+              - iam:TagInstanceProfile
+              - iam:AddRoleToInstanceProfile
+              - iam:RemoveRoleFromInstanceProfile
+            Resource:
+              - !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:role/role-${Workload}-*-${Env}-${RegionCode}-*'
+              - !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:instance-profile/role-${Workload}-*-${Env}-${RegionCode}-*'
+          - Sid: AttachOnlySsmCorePolicy
+            Effect: Allow
+            Action: [iam:AttachRolePolicy, iam:DetachRolePolicy]
+            Resource: !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:role/role-${Workload}-*-${Env}-${RegionCode}-*'
+            Condition:
+              ArnEquals:
+                'iam:PolicyARN': !Sub 'arn:${AWS::Partition}:iam::aws:policy/AmazonSSMManagedInstanceCore'
+          - Sid: PassOnlyWorkloadRolesToEc2AndFlowLogs
+            Effect: Allow
+            Action: iam:PassRole
+            Resource: !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:role/role-${Workload}-*-${Env}-${RegionCode}-*'
+            Condition:
+              StringEquals:
+                'iam:PassedToService': [ec2.amazonaws.com, vpc-flow-logs.amazonaws.com]
+          - Sid: ServiceLinkedRoles
+            Effect: Allow
+            Action: iam:CreateServiceLinkedRole
+            Resource: !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:role/aws-service-role/*'
+            Condition:
+              StringEquals:
+                'iam:AWSServiceName': [elasticloadbalancing.amazonaws.com, autoscaling.amazonaws.com, rds.amazonaws.com]
+
+Outputs:
+  CfnServiceRoleArn:
+    Description: Pass to deploy.sh with -R
+    Value: !GetAtt CfnServiceRole.Arn
