@@ -4,6 +4,8 @@
 在 AWS 上提供可水平扩展、数据层不暴露公网的三层网站。应用层用 nginx 静态页占位（显示实例 ID 与数据库端点），用来验证链路、扩缩容与监控；真实业务代码、自定义域名、WAF、CDN、CI/CD 不在本次范围。区域不固定，由 `deploy.sh` 按 `AWS::Region` 推导区域代码；命名与标签遵循 `.kiro/steering/` 规范（org=`kiro`，workload=`webapp`）。
 
 ## 2. 架构图
+可编辑源文件：[`docs/architecture.drawio`](architecture.drawio)（用 draw.io / diagrams.net 或 VS Code 的 Draw.io 插件打开，可导出 PNG/SVG）。下面是同一张图的 Mermaid 文字版，便于在 GitHub 上直接预览和对比修改。
+
 ```mermaid
 flowchart TB
   U(["用户 Internet"])
