@@ -4,7 +4,7 @@
   - [x] 1.1 新增参数、条件、HTTPS 监听与 SG 入站（需求 3.6）
   - [x] 1.2 应用角色内联日志权限；CloudWatch Agent；ASG 目标跟踪与组指标（需求 4、5）
   - [x] 1.3 Flow Logs、日志组、专用角色（需求 5.3）
-  - [x] 1.4 7 个告警（无通知；SNS/KMS 因权限去掉）（需求 5.1）
+  - [x] 1.4 告警（ec2 模式 6 个、rds 模式 7 个；无通知，SNS/KMS 因权限去掉）（需求 5.1）
   - [x] 1.5 标签补全：EBS `data-class`、告警/日志组 `Name`、RDS `CopyTagsToSnapshot`（需求 6）
   - [x] 1.6 `cfn-lint` 通过，名称长度/正则自检（需求 3.1、3.2）
 - [x] 2. 更新 `infra/deploy.sh`，新增 `infra/destroy.sh`（需求 3、7）

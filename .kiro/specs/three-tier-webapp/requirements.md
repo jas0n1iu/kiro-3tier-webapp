@@ -46,7 +46,7 @@
 
 ### 需求 5：监控
 验收标准
-1. THE 模板 SHALL 创建以下 CloudWatch 告警（暂无通知动作：部署角色无 SNS 权限，经用户确认去掉 SNS）：ALB 5xx、目标 5xx、TG 不健康主机数、ASG 实例 CPU、RDS CPU、RDS 剩余存储、RDS 连接数（共 7 个）。
+1. THE 模板 SHALL 创建以下 CloudWatch 告警（暂无通知动作：部署角色无 SNS 权限，经用户确认去掉 SNS）：ALB 5xx、目标 5xx、TG 不健康主机数、ASG 实例 CPU、RDS CPU、RDS 剩余存储、RDS 连接数（`DbMode=rds` 共 7 个；`DbMode=ec2` 时 3 个 RDS 告警换成 2 个数据库主机告警，共 6 个）。
 2. THE 告警与日志组名称 SHALL 遵循 `alrt` 前缀与路径型日志组规范。
 3. THE VPC SHALL 开启 Flow Logs 到 CloudWatch Logs（日志组保留期有限）。
 4. THE 监控清单 SHALL 写入 `docs/ops-checklist.md`。
@@ -74,4 +74,4 @@
 ## 变更记录
 - 数据层：部署角色无 RDS 权限，经用户确认默认改为 EC2 自建 MariaDB（`DbMode=ec2`），RDS 保留为可选（`DbMode=rds`）。需求 4.4（RDS 托管凭证）仅在 `DbMode=rds` 下适用；`ec2` 模式下凭证为随机生成并存入 SSM SecureString。
 - 标签：需求 6.1 当前**未完全满足**：应用层与数据库主机的 EBS 根卷缺 `org/workload/env/owner/managed-by`，待修复（见 tasks.md 第 9 项）。
-- 告警：去掉 SNS 通知（无权限），7 个告警中的 3 个 RDS 告警仅在 `DbMode=rds` 创建，`ec2` 模式增加 2 个数据库主机告警。
+- 告警：去掉 SNS 通知（无权限），基础 4 个告警之外，3 个 RDS 告警仅在 `DbMode=rds` 创建，`ec2` 模式增加 2 个数据库主机告警（`ec2` 共 6 个，`rds` 共 7 个）。

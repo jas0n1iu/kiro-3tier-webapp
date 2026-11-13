@@ -13,7 +13,7 @@ CloudFormation 单栈（`DbMode=ec2` 时 52 个资源），Internet → ALB（�
 | ASG 目标跟踪（CPU 50%）、开启组指标 | 5 | |
 | CloudWatch Agent 把 nginx 日志送到 `/{env}/webapp/{region}/ec2/nginx` | 5 | 应用角色内联最小权限，仅限该日志组 |
 | VPC Flow Logs → `/{env}/webapp/{region}/vpc/flowlogs`，专用角色（含 `aws:SourceAccount/SourceArn` 防混淆代理） | 5.3 | |
-| 7 个 CloudWatch 告警，无通知动作 | 5.1 | 部署角色无 SNS 权限，用户确认去掉 SNS/KMS；日后可由有权限者补 `AlarmActions` |
+| CloudWatch 告警（`ec2` 模式 6 个、`rds` 模式 7 个），无通知动作 | 5.1 | 部署角色无 SNS 权限，用户确认去掉 SNS/KMS；日后可由有权限者补 `AlarmActions` |
 | CloudFormation 服务角色 `infra/iam/cfn-service-role.yaml` | 4 | 部署角色无 RDS/Secrets Manager 权限；管理员一次性部署服务角色，`deploy.sh -R` 使用，部署者只需 `iam:PassRole` |
 | RDS `CopyTagsToSnapshot`，快照继承成本标签 | 6 | 仅 `DbMode=rds` |
 | EBS 卷加 `data-class` 标签 | 6.1 | |
