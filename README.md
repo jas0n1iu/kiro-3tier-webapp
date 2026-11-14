@@ -16,6 +16,11 @@
 
 报告由规则生成，不调用大模型（账号没有 Bedrock 权限），结果可测试、可复现。
 
+## 截图
+![A/S 受理报告生成页面（表单与最近受理记录）](images/site-screenshot.png)
+
+页面为 HTTP 访问；ALB 地址已打码。
+
 ## 架构
 ![三层架构图](docs/architecture.png)
 
