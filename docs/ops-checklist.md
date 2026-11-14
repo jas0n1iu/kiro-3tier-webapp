@@ -8,8 +8,8 @@
 | 部署者（人/流水线） | （DbMode=ec2 时无需服务角色，用现有 EC2/ELB/ASG/S3/SSM/IAM 角色权限即可。）以下为 DbMode=rds 的要求：`cloudformation:*` 限 `stk-webapp-*`；`iam:PassRole` 仅限 CloudFormation 服务角色（`iam:PassedToService` = `cloudformation.amazonaws.com`）；`secretsmanager:TagResource` 限 `rds!db-*`（可选，缺失时只告警） | 部署者自己不持有 RDS、Secrets Manager 等创建权限 |
 | CloudFormation 服务角色 `role-webapp-cfn-ENV-RC-001` | 由 `infra/iam/cfn-service-role.yaml` 创建（管理员一次性部署）：EC2/ELB/ASG 限本区域；RDS、日志组、告警、IAM 角色按 `webapp-ENV-RC` 命名范围限定；`PassRole` 仅限 `role-webapp-*` 且传给 EC2/Flow Logs；`AttachRolePolicy` 仅限 `AmazonSSMManagedInstanceCore`；KMS 仅经 RDS/Secrets Manager 使用；信任策略限本账号 `stk-webapp-ENV-RC-*` 栈 | 部署者权限边界之外的授权都在这里，且可审计 |
 | 运维人员 | 经 Identity Center 权限集 `webapp-ops`：`ssm:StartSession`（限带 `workload=webapp` 标签的实例）、`cloudwatch:Describe*/Get*`、`logs:Get*/FilterLogEvents/StartQuery`（限 `/ENV/webapp/*`）、`rds:Describe*`（DbMode=rds）、`elasticloadbalancing:Describe*` | 无 SSH、无密钥对 |
-| 应用层 EC2 | 角色 `role-webapp-ec2app-…`：`AmazonSSMManagedInstanceCore` + 向 `/ENV/webapp/RC/ec2/nginx` 写日志 | 未授予 Secrets Manager；上线真实应用时只授 `GetSecretValue` 到具体密钥 ARN，并改用独立应用库账号 |
-| 数据库主机（DbMode=ec2） | 角色 `role-webapp-dbhost-…`：SSM 核心 + `ssm:PutParameter` 仅限 `/ENV/webapp/RC/db/admin` + `s3:PutObject` 仅限备份桶 | 无读密码、无删对象权限；读取密码由运维人员单独授权 |
+| 应用层 EC2 | 角色 `role-webapp-ec2app-…`：`AmazonSSMManagedInstanceCore` + 向 `/ENV/webapp/RC/ec2/nginx` 写日志 + `s3:GetObject` 仅限应用包对象 + `ssm:GetParameter` 仅限 `/ENV/webapp/RC/db/app` | 未授予 Secrets Manager。应用用独立数据库账号 `asapp`，只有 `asdesk.as_request` 的 SELECT/INSERT，不用 admin |
+| 数据库主机（DbMode=ec2） | 角色 `role-webapp-dbhost-…`：SSM 核心 + `ssm:PutParameter` 仅限 `/ENV/webapp/RC/db/admin` 与 `/ENV/webapp/RC/db/app` + `s3:PutObject` 仅限备份桶 | 无读密码、无删对象权限；读取密码由运维人员单独授权 |
 | VPC Flow Logs | 角色 `role-webapp-flowlog-…`：仅向 Flow Logs 日志组写入；信任策略带 `aws:SourceAccount`/`aws:SourceArn` | |
 
 核对项
@@ -57,7 +57,7 @@
 - [ ] 按标签查成本（日期用 `date` 取得，计算用脚本）：`aws ce get-cost-and-usage --time-period Start=<起>,End=<止> --granularity MONTHLY --metrics UnblendedCost --group-by Type=TAG,Key=env`
 - [ ] 建议建月度预算（Budgets 接口在 us-east-1），按 `workload=webapp` 标签过滤
 - 主要成本项：NAT Gateway、ALB、EC2（应用×2 + 数据库主机×1）、EBS、S3 备份、CloudWatch 日志（RDS 模式则含 RDS）。
-- **已知标签缺口**：3 个 EBS 根卷缺 `org/workload/env/owner/managed-by`，按标签的成本分摊会漏掉这部分（金额较小）。核对：`aws ec2 describe-volumes --filters Name=tag:aws:cloudformation:stack-name,Values=<栈名> --query 'Volumes[].[VolumeId,Tags[?Key==`workload`]|[0].Value]'`dev 不用时请整栈删除。
+- **已知标签缺口**：3 个 EBS 根卷缺 `org/workload/env/owner/managed-by`，按标签的成本分摊会漏掉这部分（金额较小）。核对（根卷不带栈标签，按实例挂载查）：`aws ec2 describe-volumes --region REGION --filters Name=attachment.instance-id,Values=<实例ID,逗号分隔> --query 'Volumes[].[VolumeId,Attachments[0].Device,Tags[?Key==`workload`]|[0].Value]'`，`None` 即缺标签。2026-11-14 实测：3 个根卷缺标签，数据卷标签齐全。dev 不用时请整栈删除。
 
 ## 4. 资源清理清单
 删除是破坏性操作，先确认环境。
@@ -69,7 +69,8 @@
    - **DbMode=ec2 专项（删栈后必定有残留，不处理会继续产生少量费用）**
      - [ ] 数据卷快照：数据卷是 `DeletionPolicy: Snapshot`，删栈会留下一个 EBS 快照。不需要时：`aws ec2 describe-snapshots --owner-ids self --filters Name=description,Values='*Created by CloudFormation*' --region REGION` → `aws ec2 delete-snapshot --snapshot-id <id>`（不可恢复）
      - [ ] S3 备份桶：桶是 `Retain`，删栈后仍在。确认不再需要后清空并删除（桶启用了版本控制，需要同时删除历史版本和删除标记）：`aws s3 rb s3://s3-kiro-webapp-dbbackup-ENV-RC-001 --force` 只删当前对象；版本化对象需用 `aws s3api list-object-versions` + `delete-objects`，或在控制台使用“清空桶”
-     - [ ] SSM 参数：`/ENV/webapp/RC/db/admin` 是实例启动脚本创建的，**不属于栈**，需手动删除：`aws ssm delete-parameter --name /ENV/webapp/RC/db/admin --region REGION`
+     - [ ] SSM 参数：`/ENV/webapp/RC/db/admin` 与 `/ENV/webapp/RC/db/app` 是实例启动脚本创建的，**不属于栈**，需手动删除：`aws ssm delete-parameter --name <参数名> --region REGION`
+     - [ ] 应用工件桶 `s3-kiro-webapp-artifact-ENV-RC-001`：`destroy.sh` 会删除；若脚本中断则手动清空并删除
    - [ ] （DbMode=rds）RDS 最终快照：栈删除会留下一个快照（`DeletionPolicy: Snapshot`），不需要时删除：`aws rds describe-db-snapshots --region REGION` → `delete-db-snapshot`（不可恢复）
    - [ ] （DbMode=rds）自动备份在实例删除后随之删除，手动快照不会——逐个检查
    - [ ] （DbMode=rds）RDS 托管密钥 `rds!db-*` 随实例删除；`aws secretsmanager list-secrets` 确认无残留

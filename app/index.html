@@ -1,0 +1,132 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>A/S 受理报告生成</title>
+<style>
+  body { font-family: system-ui, "PingFang SC", "Microsoft YaHei", sans-serif; max-width: 860px; margin: 24px auto; padding: 0 16px; color: #1a1a1a; }
+  h1 { font-size: 1.5rem; }
+  .notice { background: #fff6e0; border: 1px solid #f0c36d; padding: 8px 12px; border-radius: 6px; font-size: .9rem; }
+  label { display: block; margin-top: 12px; font-weight: 600; }
+  select, input, textarea { width: 100%; padding: 8px; font: inherit; box-sizing: border-box; }
+  .row { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+  button { margin-top: 16px; padding: 10px 18px; font: inherit; cursor: pointer; }
+  #error { color: #b00020; margin-top: 8px; min-height: 1.2em; }
+  #result { display: none; margin-top: 24px; }
+  pre { background: #f6f8fa; padding: 12px; border-radius: 6px; white-space: pre-wrap; word-break: break-word; }
+  .badge { display: inline-block; padding: 2px 10px; border-radius: 12px; font-size: .85rem; background: #e6f2ff; margin-right: 6px; }
+  table { border-collapse: collapse; width: 100%; font-size: .9rem; }
+  th, td { border: 1px solid #ddd; padding: 4px 8px; text-align: left; }
+  footer { margin-top: 32px; font-size: .8rem; color: #666; }
+</style>
+</head>
+<body>
+<h1>A/S 受理报告生成</h1>
+<p class="notice">演示系统：请只填写测试或模拟数据，<b>不要输入真实客户的姓名、电话、地址等个人信息</b>。保修期限与处理时限为示例规则。</p>
+
+<form id="form" autocomplete="off">
+  <div class="row">
+    <div><label for="product">产品类别</label>
+      <select id="product" required></select></div>
+    <div><label for="fault">故障类型</label>
+      <select id="fault" required></select></div>
+  </div>
+  <div class="row">
+    <div><label for="purchase_date">购买日期</label>
+      <input id="purchase_date" type="date" required></div>
+    <div><label for="urgency">紧急程度</label>
+      <select id="urgency" required></select></div>
+  </div>
+  <label for="symptom">故障症状描述</label>
+  <textarea id="symptom" rows="4" maxlength="500" required placeholder="例如：开机后屏幕闪烁，约 5 分钟后自动关机（测试数据）"></textarea>
+  <button type="submit">生成受理报告</button>
+  <div id="error" role="alert"></div>
+</form>
+
+<section id="result">
+  <p><span class="badge" id="b-warranty"></span><span class="badge" id="b-priority"></span><span class="badge" id="b-saved"></span></p>
+  <h2>处理优先级指导</h2><ul id="guidance"></ul>
+  <h2>预计维修步骤</h2><ol id="steps"></ol>
+  <h2>受理报告草稿</h2>
+  <pre id="report"></pre>
+  <button type="button" id="copy">复制报告</button> <span id="copied"></span>
+</section>
+
+<section>
+  <h2>最近受理记录</h2>
+  <div id="recent">加载中…</div>
+</section>
+<footer>Served by instance <span id="iid">-</span></footer>
+
+<script>
+const PRODUCTS = ["TV", "冰箱", "洗衣机", "空调", "智能手机"];
+const FAULTS = ["电源故障", "噪声", "制冷故障", "显示故障", "物理损坏"];
+const URGENCIES = ["高", "中", "低"];
+const $ = (id) => document.getElementById(id);
+
+function fill(sel, items) { items.forEach(v => { const o = document.createElement("option"); o.value = v; o.textContent = v; sel.appendChild(o); }); }
+fill($("product"), PRODUCTS); fill($("fault"), FAULTS); fill($("urgency"), URGENCIES);
+$("urgency").value = "中";
+$("purchase_date").max = new Date().toISOString().slice(0, 10);
+
+// All server text is inserted with textContent, never innerHTML.
+function setList(el, items) { el.replaceChildren(...items.map(t => { const li = document.createElement("li"); li.textContent = t; return li; })); }
+
+async function loadRecent() {
+  try {
+    const r = await (await fetch("/api/recent")).json();
+    const box = $("recent");
+    if (!r.available) { box.textContent = "数据库暂不可用。"; return; }
+    if (!r.items.length) { box.textContent = "暂无记录。"; return; }
+    const t = document.createElement("table");
+    const head = t.insertRow();
+    ["受理编号", "产品", "故障", "紧急", "保修", "时间"].forEach(h => { const th = document.createElement("th"); th.textContent = h; head.appendChild(th); });
+    r.items.forEach(i => { const row = t.insertRow(); [i.ticket_no, i.product, i.fault, i.urgency, i.warranty_status, i.created_at].forEach(v => { row.insertCell().textContent = v; }); });
+    box.replaceChildren(t);
+  } catch (e) { $("recent").textContent = "加载失败。"; }
+}
+
+$("form").addEventListener("submit", async (ev) => {
+  ev.preventDefault();
+  $("error").textContent = "";
+  const body = {
+    product: $("product").value, fault: $("fault").value, purchase_date: $("purchase_date").value,
+    symptom: $("symptom").value, urgency: $("urgency").value,
+  };
+  try {
+    const resp = await fetch("/api/report", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+    const data = await resp.json();
+    if (!resp.ok) { $("error").textContent = data.error || "提交失败"; return; }
+    $("b-warranty").textContent = data.warranty.status;
+    $("b-priority").textContent = data.priority.level;
+    $("b-saved").textContent = data.saved ? "已保存到数据库" : "未保存（数据库不可用）";
+    setList($("guidance"), [data.priority.contact, data.priority.service].concat(data.priority.guidance));
+    setList($("steps"), data.steps);
+    $("report").textContent = data.report_text;
+    $("result").style.display = "block";
+    $("copied").textContent = "";
+    loadRecent();
+  } catch (e) { $("error").textContent = "网络错误，请重试"; }
+});
+
+// navigator.clipboard needs HTTPS; the site is HTTP by default, so fall back to execCommand.
+$("copy").addEventListener("click", async () => {
+  const text = $("report").textContent;
+  let ok = false;
+  try { if (navigator.clipboard && window.isSecureContext) { await navigator.clipboard.writeText(text); ok = true; } } catch (e) {}
+  if (!ok) {
+    const ta = document.createElement("textarea");
+    ta.value = text; ta.style.position = "fixed"; ta.style.opacity = "0";
+    document.body.appendChild(ta); ta.select();
+    try { ok = document.execCommand("copy"); } catch (e) {}
+    document.body.removeChild(ta);
+  }
+  $("copied").textContent = ok ? "已复制" : "复制失败，请手动选择文本";
+});
+
+fetch("/api/info").then(r => r.json()).then(d => { $("iid").textContent = d.instance_id || "-"; }).catch(() => {});
+loadRecent();
+</script>
+</body>
+</html>

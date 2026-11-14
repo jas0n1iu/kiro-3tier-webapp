@@ -29,7 +29,8 @@ CloudFormation 单栈（`DbMode=ec2` 时 52 个资源），Internet → ALB（�
 
 ## 关键取舍
 - 单 NAT：约省 $32/月/个，代价是 AZ-a 故障时应用层出网中断；升级路径为每 AZ 一个 NAT + 每 AZ 一张应用路由表。
-- 应用层不读数据库密钥：演示页只显示端点，故不授予 `secretsmanager:GetSecretValue`（最小权限）。真实应用上线时再按密钥 ARN 授权，且应使用独立的应用库账号而非主账号。
+- 应用层用独立数据库账号 `asapp`（仅 `as_request` 表的 SELECT/INSERT），密码在 SSM SecureString，应用角色只能读该参数；不授予 `secretsmanager:GetSecretValue`，也不使用 admin。
+- 不启用 HTTPS：账号无 ACM/IAM 证书/CloudFront/Route 53 权限，ALB 无法装证书。接受 HTTP 的理由：只处理模拟数据、不收集个人信息。启用路径：`deploy.sh -c <ACM 证书 ARN>`（未验证），并向管理员申请权限。
 - 不用 ALB 访问日志：需要 S3 桶（额外资源与清理项），列入后续改进。
 - 数据存储用 `DeletionPolicy: Snapshot`（RDS 实例，或 `ec2` 模式的数据卷）：删栈会留下快照；`ec2` 模式的备份桶是 `Retain`，SSM 密码参数由实例脚本创建、不属于栈。清理清单要求人工确认并删除。
 

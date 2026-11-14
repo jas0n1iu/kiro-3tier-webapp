@@ -1,5 +1,9 @@
 .env
+.env.*
 *.pem
 *.key
-.log
+*.pfx
+*.log
 .aws/
+__pycache__/
+*.pyc

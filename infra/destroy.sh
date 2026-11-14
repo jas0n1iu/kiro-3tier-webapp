@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Delete the three-tier stack. DESTRUCTIVE: removes ALB, EC2 (app + db host), NAT, logs (and RDS in DbMode=rds).
-# Left behind on purpose: data volume / RDS snapshot, the S3 backup bucket, and the SSM password parameter.
+# Removed too: the app artifact bucket that deploy.sh created (not part of the stack).
+# Left behind on purpose: data volume / RDS snapshot, the S3 backup bucket, and the SSM password parameters.
 # Usage: ./destroy.sh [-e dev] [-r us-west-2] [-y <stack-name>]
 #   Without -y you are prompted to type the stack name. env=prod is refused.
 set -euo pipefail
@@ -42,4 +43,12 @@ fi
 aws cloudformation delete-stack --region "$REGION" --stack-name "$STACK"
 aws cloudformation wait stack-delete-complete --region "$REGION" --stack-name "$STACK"
 echo "Deleted $STACK."
+
+# Artifact bucket (created by deploy.sh, unversioned): empty it, then delete it. Missing bucket is fine.
+ARTIFACT_BUCKET="s3-kiro-${WORKLOAD}-artifact-${ENV}-${CODE}-${INSTANCE}"
+if aws s3api head-bucket --bucket "$ARTIFACT_BUCKET" --region "$REGION" 2>/dev/null; then
+  aws s3 rm "s3://$ARTIFACT_BUCKET" --recursive --region "$REGION" --only-show-errors
+  aws s3api delete-bucket --bucket "$ARTIFACT_BUCKET" --region "$REGION"
+  echo "Deleted artifact bucket $ARTIFACT_BUCKET."
+fi
 echo "Now walk through docs/ops-checklist.md section 4 (data snapshot, backup bucket, SSM parameter, leftovers, billing tags)."

@@ -94,6 +94,14 @@ Parameters:
     Type: String
     Default: 'false'
     AllowedValues: ['true', 'false']
+  AppBundleBucket:
+    Type: String
+    AllowedPattern: '^[a-z0-9][a-z0-9.-]{2,62}$'
+    Description: S3 bucket holding the packed A/S app. Created and filled by deploy.sh.
+  AppBundleKey:
+    Type: String
+    AllowedPattern: '^[A-Za-z0-9._/-]{1,200}$'
+    Description: Object key of the app bundle (content hash in the name). Supplied by deploy.sh.
   AmiId:
     Type: 'AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>'
     Default: /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64
@@ -361,7 +369,7 @@ Resources:
 
   # ------------------------------------------------------------- Application
   # Least privilege: SSM Session Manager (no SSH) + write to its own nginx log group only.
-  # No Secrets Manager access: the placeholder page never reads the DB secret.
+  # No Secrets Manager access. The A/S app reads only its own SSM parameter (.../db/app, a limited DB user).
   AppRole:
     Type: AWS::IAM::Role
     Properties:
@@ -382,6 +390,14 @@ Resources:
               - Effect: Allow
                 Action: [logs:CreateLogStream, logs:PutLogEvents, logs:DescribeLogStreams]
                 Resource: !GetAtt AppLogGroup.Arn
+              - Sid: ReadAppBundle
+                Effect: Allow
+                Action: s3:GetObject
+                Resource: !Sub 'arn:${AWS::Partition}:s3:::${AppBundleBucket}/${AppBundleKey}'
+              - Sid: ReadAppDbPassword
+                Effect: Allow
+                Action: ssm:GetParameter
+                Resource: !Sub 'arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${Env}/${Workload}/${RegionCode}/db/app'
       Tags:
         - { Key: Name, Value: !Sub 'role-${Workload}-ec2app-${Env}-${RegionCode}-${Instance}' }
 
@@ -426,7 +442,8 @@ Resources:
             - |
               #!/bin/bash
               set -euxo pipefail
-              dnf install -y nginx amazon-cloudwatch-agent
+              dnf install -y nginx amazon-cloudwatch-agent python3-pip
+              pip3 install pymysql
               TOKEN=$(curl -sX PUT http://169.254.169.254/latest/api/token -H 'X-aws-ec2-metadata-token-ttl-seconds: 300')
               IID=$(curl -s -H "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/meta-data/instance-id)
               cat > /opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json <<CWEOF
@@ -436,12 +453,40 @@ Resources:
               ]}}}}
               CWEOF
               /opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl -a fetch-config -m ec2 -s -c file:/opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json
+
+              # A/S app bundle: deploy.sh packs ../app and uploads it to the artifact bucket (see AppBundleBucket/Key).
+              mkdir -p /opt/asdesk
+              aws s3 cp s3://${AppBundleBucket}/${AppBundleKey} /tmp/asdesk.tgz --region ${AWS::Region}
+              tar xzf /tmp/asdesk.tgz -C /opt/asdesk
+              rm -f /tmp/asdesk.tgz
+              cp /opt/asdesk/index.html /usr/share/nginx/html/index.html
               echo ok > /usr/share/nginx/html/health
-              cat > /usr/share/nginx/html/index.html <<EOF
-              <!doctype html><html lang="en"><head><meta charset="utf-8"><title>${Workload} ${Env}</title></head>
-              <body><h1>${Workload} (${Env})</h1><p>Served by instance $IID in ${AWS::Region}.</p>
-              <p>Database endpoint: ${DbHost}</p></body></html>
-              EOF
+              useradd --system --no-create-home --shell /sbin/nologin asdesk || true
+              cat > /etc/systemd/system/asdesk.service <<UNIT
+              [Unit]
+              Description=A/S report API
+              After=network-online.target
+              [Service]
+              User=asdesk
+              WorkingDirectory=/opt/asdesk
+              Environment=DB_HOST=${DbHost}
+              Environment=DB_PASSWORD_PARAM=/${Env}/${Workload}/${RegionCode}/db/app
+              Environment=AWS_REGION=${AWS::Region}
+              Environment=INSTANCE_ID=$IID
+              ExecStart=/usr/bin/python3 /opt/asdesk/server.py
+              Restart=always
+              [Install]
+              WantedBy=multi-user.target
+              UNIT
+              cat > /etc/nginx/default.d/asdesk.conf <<'NGX'
+              location /api/ {
+                proxy_pass http://127.0.0.1:8000;
+                proxy_read_timeout 15s;
+                client_max_body_size 16k;
+              }
+              NGX
+              systemctl daemon-reload
+              systemctl enable --now asdesk
               systemctl enable --now nginx
             - DbHost: !If [UseRds, !GetAtt Database.Endpoint.Address, !GetAtt DbInstance.PrivateIp]
 
@@ -539,7 +584,9 @@ Resources:
               - Sid: StoreGeneratedAdminPassword
                 Effect: Allow
                 Action: ssm:PutParameter
-                Resource: !Sub 'arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${Env}/${Workload}/${RegionCode}/db/admin'
+                Resource:
+                  - !Sub 'arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${Env}/${Workload}/${RegionCode}/db/admin'
+                  - !Sub 'arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${Env}/${Workload}/${RegionCode}/db/app'
               - Sid: WriteBackups
                 Effect: Allow
                 Action: s3:PutObject
@@ -681,6 +728,32 @@ Resources:
           aws ssm put-parameter --region ${AWS::Region} --name /${Env}/${Workload}/${RegionCode}/db/admin \
             --type SecureString --overwrite --value file:///root/.dbpw > /dev/null
           rm -f /root/.dbpw
+
+          # A/S app: own database, one table, and a limited user (INSERT/SELECT on that table only).
+          # Its random password goes to SSM SecureString /{env}/webapp/{region}/db/app; the app role can read only that.
+          PW2=$(openssl rand -base64 24 | tr -d '/+=' | cut -c1-24)
+          mysql -uroot <<SQL
+          CREATE DATABASE IF NOT EXISTS asdesk CHARACTER SET utf8mb4;
+          CREATE TABLE IF NOT EXISTS asdesk.as_request (
+            id BIGINT AUTO_INCREMENT PRIMARY KEY,
+            product VARCHAR(20) NOT NULL,
+            fault VARCHAR(20) NOT NULL,
+            purchase_date DATE NOT NULL,
+            symptom VARCHAR(500) NOT NULL,
+            urgency VARCHAR(4) NOT NULL,
+            warranty_status VARCHAR(10) NOT NULL,
+            created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+          ) DEFAULT CHARSET=utf8mb4;
+          CREATE USER IF NOT EXISTS 'asapp'@'%' IDENTIFIED BY '$PW2';
+          ALTER USER 'asapp'@'%' IDENTIFIED BY '$PW2';
+          GRANT SELECT, INSERT ON asdesk.as_request TO 'asapp'@'%';
+          FLUSH PRIVILEGES;
+          SQL
+          printf %s "$PW2" > /root/.dbpw2
+          unset PW2
+          aws ssm put-parameter --region ${AWS::Region} --name /${Env}/${Workload}/${RegionCode}/db/app \
+            --type SecureString --overwrite --value file:///root/.dbpw2 > /dev/null
+          rm -f /root/.dbpw2
           set -x
 
           # Daily logical backup to S3 (systemd timer; AL2023 ships no cron).
